@@ -17,6 +17,9 @@ target_link_libraries(demo PRIVATE queueforge)
 add_executable(broker src/broker.cpp)
 target_link_libraries(broker PRIVATE queueforge)
 
+add_executable(worker src/worker.cpp)
+target_link_libraries(worker PRIVATE queueforge)
+
 # Tests 
 include(FetchContent)
 FetchContent_Declare(
