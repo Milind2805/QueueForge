@@ -14,7 +14,10 @@ target_link_libraries(queueforge INTERFACE Threads::Threads)
 add_executable(demo src/main.cpp)
 target_link_libraries(demo PRIVATE queueforge)
 
-# Tests (GoogleTest is downloaded automatically)
+add_executable(broker src/broker.cpp)
+target_link_libraries(broker PRIVATE queueforge)
+
+# Tests 
 include(FetchContent)
 FetchContent_Declare(
   googletest
