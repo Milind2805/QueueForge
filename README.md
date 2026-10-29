@@ -10,10 +10,3 @@ cmake --build build
 ctest --test-dir build
 ```
 
-## Roadmap
-- [x] Job struct and thread-safe priority queue
-- [ ] TCP broker (SUBMIT / FETCH / ACK / FAIL)
-- [ ] Workers as separate processes
-- [ ] Retries, backoff, visibility timeout, dead-letter queue
-- [ ] Delayed jobs, write-ahead log, crash recovery
-- [ ] Metrics endpoint, dashboard, load-test results
