@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <chrono>
 
 #include <atomic>
 #include <functional>
@@ -43,7 +44,7 @@ public:
             std::string reply = "JOB " + std::to_string(job->id) + " " +
                                 job->type + " " + job->payload + "\n";
             std::lock_guard<std::mutex> lock(mu_);
-            running_[job->id] = *job;
+            running_[job->id] = Running{*job, std::chrono::steady_clock::now() + kVisibilityTimeout};
             return reply;
         }
 
@@ -53,7 +54,7 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             auto it = running_.find(id);
             if (it == running_.end()) return "ERR unknown job\n";
-            Job job = it->second;
+            Job job = it->second.job;
             running_.erase(it);
             if (cmd == "ACK") {
                 done_++;
@@ -75,11 +76,32 @@ public:
 
         return "ERR unknown command\n";
     }
+    
+    void reap_expired() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mu_);
+        for (auto it = running_.begin(); it != running_.end();) {
+            if (it->second.deadline <= now) {
+                Job job = it->second.job;
+                it = running_.erase(it);
+                std::cout << "[broker] job " << job.id << " timed out\n";
+                if (job.attempts >= job.max_attempts) dead_++;
+                else queue_.push(std::move(job));
+            } else {
+                ++it;
+            }
+        }
+    }
 
 private:
     JobQueue queue_;
     std::mutex mu_;  // protects running_, done_, dead_
-    std::unordered_map<uint64_t, Job> running_;
+    struct Running {
+        Job job;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static constexpr std::chrono::seconds kVisibilityTimeout{15};
+    std::unordered_map<uint64_t, Running> running_;
     std::atomic<uint64_t> next_id_{1};
     int done_ = 0;
     int dead_ = 0;
@@ -122,6 +144,12 @@ int main() {
     std::cout << "Broker listening on port 7000\n";
 
     Broker broker;
+    std::thread([&broker] {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            broker.reap_expired();
+        }
+    }).detach();
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) continue;

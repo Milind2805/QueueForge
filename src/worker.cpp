@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
         std::string tag, type;
         uint64_t id;
         in >> tag >> id >> type;
+        if (type == "slow") std::this_thread::sleep_for(std::chrono::seconds(10));
 
         std::this_thread::sleep_for(std::chrono::milliseconds(work_ms(rng)));
 
