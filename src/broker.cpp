@@ -2,11 +2,12 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <chrono>
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -16,6 +17,7 @@
 #include "queueforge/job_queue.hpp"
 
 using namespace qf;
+using Clock = std::chrono::steady_clock;
 
 class Broker {
 public:
@@ -28,11 +30,23 @@ public:
             Job job;
             if (!(in >> job.priority >> job.type))
                 return "ERR usage: SUBMIT <priority> <type> [payload]\n";
-            std::getline(in, job.payload);
-            if (!job.payload.empty() && job.payload[0] == ' ') job.payload.erase(0, 1);
+            read_payload(in, job);
             job.id = next_id_++;
             uint64_t id = job.id;
             queue_.push(std::move(job));
+            return "OK " + std::to_string(id) + "\n";
+        }
+
+        if (cmd == "SUBMIT_AT") {
+            int delay_s;
+            Job job;
+            if (!(in >> delay_s >> job.priority >> job.type) || delay_s < 0)
+                return "ERR usage: SUBMIT_AT <delay_s> <priority> <type> [payload]\n";
+            read_payload(in, job);
+            job.id = next_id_++;
+            uint64_t id = job.id;
+            std::lock_guard<std::mutex> lock(mu_);
+            delayed_.emplace(Clock::now() + std::chrono::seconds(delay_s), std::move(job));
             return "OK " + std::to_string(id) + "\n";
         }
 
@@ -44,7 +58,7 @@ public:
             std::string reply = "JOB " + std::to_string(job->id) + " " +
                                 job->type + " " + job->payload + "\n";
             std::lock_guard<std::mutex> lock(mu_);
-            running_[job->id] = Running{*job, std::chrono::steady_clock::now() + kVisibilityTimeout};
+            running_[job->id] = Running{*job, Clock::now() + kVisibilityTimeout};
             return reply;
         }
 
@@ -69,6 +83,7 @@ public:
         if (cmd == "STATS") {
             std::lock_guard<std::mutex> lock(mu_);
             return "queued=" + std::to_string(queue_.size()) +
+                   " delayed=" + std::to_string(delayed_.size()) +
                    " running=" + std::to_string(running_.size()) +
                    " done=" + std::to_string(done_) +
                    " dead=" + std::to_string(dead_) + "\n";
@@ -76,10 +91,19 @@ public:
 
         return "ERR unknown command\n";
     }
-    
-    void reap_expired() {
-        auto now = std::chrono::steady_clock::now();
+
+    // Called by the timer thread twice a second.
+    void tick() {
+        auto now = Clock::now();
         std::lock_guard<std::mutex> lock(mu_);
+
+        // 1. Delayed jobs whose time has come become runnable.
+        while (!delayed_.empty() && delayed_.begin()->first <= now) {
+            queue_.push(std::move(delayed_.begin()->second));
+            delayed_.erase(delayed_.begin());
+        }
+
+        // 2. Running jobs whose worker went silent are put back.
         for (auto it = running_.begin(); it != running_.end();) {
             if (it->second.deadline <= now) {
                 Job job = it->second.job;
@@ -94,13 +118,21 @@ public:
     }
 
 private:
-    JobQueue queue_;
-    std::mutex mu_;  // protects running_, done_, dead_
     struct Running {
         Job job;
-        std::chrono::steady_clock::time_point deadline;
+        Clock::time_point deadline;
     };
+    // Must be longer than the slowest job, or healthy jobs get taken back.
     static constexpr std::chrono::seconds kVisibilityTimeout{15};
+
+    static void read_payload(std::istringstream& in, Job& job) {
+        std::getline(in, job.payload);
+        if (!job.payload.empty() && job.payload[0] == ' ') job.payload.erase(0, 1);
+    }
+
+    JobQueue queue_;
+    std::mutex mu_;  // protects delayed_, running_, done_, dead_
+    std::multimap<Clock::time_point, Job> delayed_;
     std::unordered_map<uint64_t, Running> running_;
     std::atomic<uint64_t> next_id_{1};
     int done_ = 0;
@@ -144,12 +176,14 @@ int main() {
     std::cout << "Broker listening on port 7000\n";
 
     Broker broker;
+
     std::thread([&broker] {
         while (true) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            broker.reap_expired();
+            broker.tick();
         }
     }).detach();
+
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) continue;
