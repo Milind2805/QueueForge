@@ -2,7 +2,7 @@
 
 A job queue written from scratch in C++17: a TCP broker, multi-process workers, priorities, delayed jobs, retries with dead-lettering, crash recovery, and a live dashboard.
 
-![Dashboard](docs/dashboard.png)
+![Dashboard](docs/QueueForge_Dashboard.png)
 
 ## Architecture
 
