@@ -14,7 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-
+#include "queueforge/dashboard.hpp"
 #include "queueforge/job_queue.hpp"
 #include "queueforge/wal.hpp"
 
@@ -124,6 +124,18 @@ public:
 
         return "ERR unknown command\n";
     }
+        // Same numbers as STATS, as JSON for the dashboard.
+    std::string stats_json() {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto up = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - started_).count();
+        return "{\"queued\":" + std::to_string(queue_.size()) +
+               ",\"delayed\":" + std::to_string(delayed_.size()) +
+               ",\"running\":" + std::to_string(running_.size()) +
+               ",\"done\":" + std::to_string(done_) +
+               ",\"dead\":" + std::to_string(dead_) +
+               ",\"timeouts\":" + std::to_string(timeouts_) +
+               ",\"uptime_s\":" + std::to_string(up) + "}";
+    }
 
     // Called by the timer thread twice a second.
     void tick() {
@@ -140,6 +152,7 @@ public:
                 Job job = it->second.job;
                 it = running_.erase(it);
                 std::cout << "[broker] job " << job.id << " timed out\n";
+                timeouts_++;
                 if (job.attempts >= job.max_attempts) {
                     wal_.log_dead(job.id);
                     dead_++;
@@ -183,6 +196,8 @@ private:
     std::atomic<uint64_t> next_id_;
     int done_ = 0;
     int dead_ = 0;
+    int timeouts_ = 0;
+    Clock::time_point started_ = Clock::now();
 };
 
 void serve_client(int fd, Broker& broker) {
@@ -237,6 +252,9 @@ int main() {
     }
     listen(server_fd, 16);
     std::cout << "Broker listening on port 7000\n";
+        std::thread(run_dashboard, 8080,
+                std::function<std::string()>([&broker] { return broker.stats_json(); }))
+        .detach();
 
     std::thread([&broker] {
         while (true) {
