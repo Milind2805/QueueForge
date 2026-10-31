@@ -20,6 +20,9 @@ target_link_libraries(broker PRIVATE queueforge)
 add_executable(worker src/worker.cpp)
 target_link_libraries(worker PRIVATE queueforge)
 
+add_executable(loadtest src/loadtest.cpp)
+target_link_libraries(loadtest PRIVATE queueforge)
+
 # Tests 
 include(FetchContent)
 FetchContent_Declare(

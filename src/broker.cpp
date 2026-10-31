@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <functional>
 #include <iostream>
@@ -199,7 +200,11 @@ void serve_client(int fd, Broker& broker) {
 
 int main() {
     // 1. Recover state from the log before accepting any connection.
-    Wal wal("queueforge.wal");
+        // QF_SYNC=0 turns off fsync-per-write (faster, but a power cut can lose the last few jobs).
+    const char* sync_env = std::getenv("QF_SYNC");
+    bool sync_every_write = !(sync_env && std::string(sync_env) == "0");
+    Wal wal("queueforge.wal", sync_every_write);
+    std::cout << "fsync per write: " << (sync_every_write ? "on" : "off") << "\n";
     uint64_t max_id = 0;
     std::vector<WalJob> live = wal.recover(max_id);
     if (!wal.compact_and_open(live)) {
