@@ -87,23 +87,29 @@ public:
             return reply;
         }
 
-        if (cmd == "ACK" || cmd == "FAIL") {
+                if (cmd == "ACK" || cmd == "FAIL") {
             uint64_t id;
             if (!(in >> id)) return "ERR usage: " + cmd + " <id>\n";
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = running_.find(id);
-            if (it == running_.end()) return "ERR unknown job\n";
-            Job job = it->second.job;
-            running_.erase(it);
-            if (cmd == "ACK") {
-                wal_.log_ack(id);
-                done_++;
-            } else if (job.attempts >= job.max_attempts) {
-                wal_.log_dead(id);
-                dead_++;
-            } else {
-                queue_.push(std::move(job));
+            enum { kNothing, kAcked, kDead } log_what = kNothing;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                auto it = running_.find(id);
+                if (it == running_.end()) return "ERR unknown job\n";
+                Job job = it->second.job;
+                running_.erase(it);
+                if (cmd == "ACK") {
+                    done_++;
+                    log_what = kAcked;
+                } else if (job.attempts >= job.max_attempts) {
+                    dead_++;
+                    log_what = kDead;
+                } else {
+                    queue_.push(std::move(job));
+                }
             }
+            // Log outside the broker lock so concurrent ACKs can share one fsync.
+            if (log_what == kAcked) wal_.log_ack(id);
+            if (log_what == kDead) wal_.log_dead(id);
             return "OK\n";
         }
 

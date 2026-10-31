@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -107,19 +108,41 @@ private:
                std::to_string(j.run_at_ms) + " " + j.type + " " + j.payload + "\n";
     }
 
-    // One write() per record, then fsync so it is on disk before we reply.
+        // Group commit: every record is written under the lock, but fsync runs
+    // OUTSIDE it. While one thread is in fsync, other threads append their
+    // records; the next fsync then makes all of them durable in one go.
+    // Each caller still returns only after its own record is on disk.
     void append(const std::string& rec) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::mutex> lock(mu_);
         if (fd_ < 0) return;
         if (::write(fd_, rec.data(), rec.size()) != static_cast<ssize_t>(rec.size()))
             std::fprintf(stderr, "[wal] write failed\n");
-        if (sync_) ::fsync(fd_);
-    }
+        uint64_t my_seq = ++written_seq_;
+        if (!sync_) return;
 
+        while (synced_seq_ < my_seq) {
+            if (!syncing_) {
+                syncing_ = true;                 // I am the leader for this round
+                uint64_t target = written_seq_;  // covers everything written so far
+                lock.unlock();
+                ::fsync(fd_);
+                lock.lock();
+                synced_seq_ = target;
+                syncing_ = false;
+                cv_.notify_all();
+            } else {
+                cv_.wait(lock);                  // a leader is syncing; wait for it
+            }
+        }
+    }
     std::string path_;
     bool sync_;
     int fd_ = -1;
-    std::mutex mu_;
+        std::mutex mu_;
+    std::condition_variable cv_;
+    uint64_t written_seq_ = 0;  // records written
+    uint64_t synced_seq_ = 0;   // records known to be on disk
+    bool syncing_ = false;      // a thread is inside fsync
 };
 
 }  // namespace qf
