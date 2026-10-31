@@ -15,12 +15,34 @@
 #include <unordered_map>
 
 #include "queueforge/job_queue.hpp"
+#include "queueforge/wal.hpp"
 
 using namespace qf;
 using Clock = std::chrono::steady_clock;
 
 class Broker {
 public:
+    Broker(Wal& wal, uint64_t first_id) : wal_(wal), next_id_(first_id) {}
+
+    // Put jobs recovered from the log back where they belong.
+    void restore(const std::vector<WalJob>& jobs) {
+        std::lock_guard<std::mutex> lock(mu_);
+        int64_t now = wall_ms();
+        for (const auto& w : jobs) {
+            Job job;
+            job.id = w.id;
+            job.priority = w.priority;
+            job.type = w.type;
+            job.payload = w.payload;
+            if (w.run_at_ms > now) {
+                delayed_.emplace(Clock::now() + std::chrono::milliseconds(w.run_at_ms - now),
+                                 std::move(job));
+            } else {
+                queue_.push(std::move(job));
+            }
+        }
+    }
+
     std::string handle(const std::string& line) {
         std::istringstream in(line);
         std::string cmd;
@@ -33,6 +55,7 @@ public:
             read_payload(in, job);
             job.id = next_id_++;
             uint64_t id = job.id;
+            wal_.log_submit(to_wal(job, 0));  // on disk BEFORE we say OK
             queue_.push(std::move(job));
             return "OK " + std::to_string(id) + "\n";
         }
@@ -45,6 +68,7 @@ public:
             read_payload(in, job);
             job.id = next_id_++;
             uint64_t id = job.id;
+            wal_.log_submit(to_wal(job, wall_ms() + delay_s * 1000LL));
             std::lock_guard<std::mutex> lock(mu_);
             delayed_.emplace(Clock::now() + std::chrono::seconds(delay_s), std::move(job));
             return "OK " + std::to_string(id) + "\n";
@@ -71,8 +95,10 @@ public:
             Job job = it->second.job;
             running_.erase(it);
             if (cmd == "ACK") {
+                wal_.log_ack(id);
                 done_++;
             } else if (job.attempts >= job.max_attempts) {
+                wal_.log_dead(id);
                 dead_++;
             } else {
                 queue_.push(std::move(job));
@@ -97,20 +123,22 @@ public:
         auto now = Clock::now();
         std::lock_guard<std::mutex> lock(mu_);
 
-        // 1. Delayed jobs whose time has come become runnable.
         while (!delayed_.empty() && delayed_.begin()->first <= now) {
             queue_.push(std::move(delayed_.begin()->second));
             delayed_.erase(delayed_.begin());
         }
 
-        // 2. Running jobs whose worker went silent are put back.
         for (auto it = running_.begin(); it != running_.end();) {
             if (it->second.deadline <= now) {
                 Job job = it->second.job;
                 it = running_.erase(it);
                 std::cout << "[broker] job " << job.id << " timed out\n";
-                if (job.attempts >= job.max_attempts) dead_++;
-                else queue_.push(std::move(job));
+                if (job.attempts >= job.max_attempts) {
+                    wal_.log_dead(job.id);
+                    dead_++;
+                } else {
+                    queue_.push(std::move(job));
+                }
             } else {
                 ++it;
             }
@@ -130,11 +158,22 @@ private:
         if (!job.payload.empty() && job.payload[0] == ' ') job.payload.erase(0, 1);
     }
 
+    static WalJob to_wal(const Job& j, int64_t run_at_ms) {
+        WalJob w;
+        w.id = j.id;
+        w.priority = j.priority;
+        w.run_at_ms = run_at_ms;
+        w.type = j.type;
+        w.payload = j.payload;
+        return w;
+    }
+
+    Wal& wal_;
     JobQueue queue_;
     std::mutex mu_;  // protects delayed_, running_, done_, dead_
     std::multimap<Clock::time_point, Job> delayed_;
     std::unordered_map<uint64_t, Running> running_;
-    std::atomic<uint64_t> next_id_{1};
+    std::atomic<uint64_t> next_id_;
     int done_ = 0;
     int dead_ = 0;
 };
@@ -159,6 +198,19 @@ void serve_client(int fd, Broker& broker) {
 }
 
 int main() {
+    // 1. Recover state from the log before accepting any connection.
+    Wal wal("queueforge.wal");
+    uint64_t max_id = 0;
+    std::vector<WalJob> live = wal.recover(max_id);
+    if (!wal.compact_and_open(live)) {
+        std::cerr << "cannot open queueforge.wal\n";
+        return 1;
+    }
+    Broker broker(wal, max_id + 1);
+    broker.restore(live);
+    std::cout << "Recovered " << live.size() << " job(s) from queueforge.wal\n";
+
+    // 2. Start listening.
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -174,8 +226,6 @@ int main() {
     }
     listen(server_fd, 16);
     std::cout << "Broker listening on port 7000\n";
-
-    Broker broker;
 
     std::thread([&broker] {
         while (true) {
